@@ -136,9 +136,3 @@ Point Mercury at your plugin directory:
 NA_PLUGIN_PATH=/path/to/dir/containing/libna_plugin_xyz.so  your_application
 ```
 
-Or register the plugin programmatically from C:
-
-```c
-extern const struct na_class_ops na_xyz_class_ops_g;
-NA_Register_plugin(&na_xyz_class_ops_g);
-```
