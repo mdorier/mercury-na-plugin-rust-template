@@ -15,6 +15,24 @@ use crate::runtime::{Command, CompletionItem};
 pub const MAX_MSG_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
+//  Transport configuration
+// ---------------------------------------------------------------------------
+
+/// Which transports are enabled, and which is the priority (displayed by default).
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    pub tcp: bool,
+    pub quic: bool,
+    pub priority: TransportKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Tcp,
+    Quic,
+}
+
+// ---------------------------------------------------------------------------
 //  Plugin-level state (stored in na_class.plugin_class)
 // ---------------------------------------------------------------------------
 
@@ -30,6 +48,10 @@ pub struct NaLibp2pClass {
     /// Shared with the async runtime for RMA operations.
     pub mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>>,
     pub next_mem_handle_id: AtomicU64,
+    /// Transport configuration (TCP, QUIC, or both).
+    pub transport_config: TransportConfig,
+    /// All resolved listen multiaddrs (TCP and/or QUIC) — used by addr_to_string hints.
+    pub listen_addrs: Vec<Multiaddr>,
 }
 
 impl NaLibp2pClass {
@@ -92,12 +114,19 @@ pub struct NaLibp2pAddr {
 }
 
 impl NaLibp2pAddr {
-    /// Format: `libp2p:<multiaddr>/p2p/<peer-id>`
-    /// e.g.   `libp2p:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW...`
+    /// Format: `<transport>:<multiaddr>/p2p/<peer-id>`
+    /// e.g.   `tcp:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW...`
+    /// or     `quic:/ip4/192.168.1.10/udp/43210/quic-v1/p2p/12D3KooW...`
+    ///
+    /// Mercury prepends `libp2p+` automatically, giving:
+    /// `libp2p+tcp:/ip4/.../tcp/.../p2p/...`
     pub fn to_addr_string(&self) -> String {
         match &self.multiaddr {
-            Some(ma) => format!("libp2p:{}/p2p/{}", ma, self.peer_id),
-            None => format!("libp2p:/p2p/{}", self.peer_id),
+            Some(ma) => {
+                let prefix = transport_prefix_for_multiaddr(ma);
+                format!("{prefix}:{}/p2p/{}", ma, self.peer_id)
+            }
+            None => format!("tcp:/p2p/{}", self.peer_id),
         }
     }
 
@@ -156,4 +185,18 @@ pub struct NaLibp2pMemHandle {
     pub handle_id: u64,
     pub flags: u64,
     pub owner_peer_id: Option<PeerId>,
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+/// Determine transport prefix ("tcp" or "quic") from a multiaddr's content.
+pub fn transport_prefix_for_multiaddr(ma: &Multiaddr) -> &'static str {
+    for proto in ma.iter() {
+        if matches!(proto, libp2p::multiaddr::Protocol::QuicV1) {
+            return "quic";
+        }
+    }
+    "tcp"
 }

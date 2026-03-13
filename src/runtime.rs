@@ -12,7 +12,7 @@ use tracing::{debug, error, warn};
 
 use crate::protocol::{self, MessageType, WireHeader};
 use crate::state::{
-    MemHandleEntry, NaLibp2pAddr, OperationQueues, StashedMessage,
+    MemHandleEntry, NaLibp2pAddr, OperationQueues, StashedMessage, TransportConfig,
 };
 use crate::bindings::*;
 use crate::{NA_PROTOCOL_ERROR, NA_SUCCESS};
@@ -242,10 +242,12 @@ struct SharedAsyncState {
 // ---------------------------------------------------------------------------
 
 /// Build and spawn the swarm on the tokio runtime.
-/// Returns (cmd_tx, completion_rx, self_peer_id, listen_ip, listen_port, join_handle).
+/// Returns (cmd_tx, completion_rx, self_peer_id, listen_multiaddrs, join_handle).
+/// `listen_multiaddrs` contains all resolved listen addresses (TCP and/or QUIC).
 pub fn spawn_swarm_task(
     rt: &tokio::runtime::Runtime,
-    listen_addr: Multiaddr,
+    listen_addrs: Vec<Multiaddr>,
+    transport_config: &TransportConfig,
     queues: Arc<Mutex<OperationQueues>>,
     mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>>,
     event_fd: RawFd,
@@ -254,52 +256,91 @@ pub fn spawn_swarm_task(
         mpsc::UnboundedSender<Command>,
         mpsc::UnboundedReceiver<CompletionItem>,
         PeerId,
-        std::net::IpAddr,
-        u16,
+        Vec<Multiaddr>,
         tokio::task::JoinHandle<()>,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    let has_tcp = transport_config.tcp;
+    let has_quic = transport_config.quic;
+
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel::<CompletionItem>();
 
-    let (peer_id, listen_ip, listen_port, join_handle) = rt.block_on(async {
-        let mut swarm = libp2p::SwarmBuilder::with_new_identity()
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default().nodelay(true),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )?
-            .with_behaviour(|_| stream::Behaviour::new())?
-            .with_swarm_config(|cfg| {
-                cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
-            })
-            .build();
+    let (peer_id, resolved_addrs, join_handle) = rt.block_on(async {
+        // Build swarm with the requested transport(s)
+        let mut swarm = match (has_tcp, has_quic) {
+            (true, true) => {
+                // Both TCP and QUIC
+                libp2p::SwarmBuilder::with_new_identity()
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default().nodelay(true),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_quic()
+                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_swarm_config(|cfg| {
+                        cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
+                    })
+                    .build()
+            }
+            (true, false) => {
+                // TCP only
+                libp2p::SwarmBuilder::with_new_identity()
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default().nodelay(true),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_swarm_config(|cfg| {
+                        cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
+                    })
+                    .build()
+            }
+            (false, true) => {
+                // QUIC only
+                libp2p::SwarmBuilder::with_new_identity()
+                    .with_tokio()
+                    .with_quic()
+                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_swarm_config(|cfg| {
+                        cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
+                    })
+                    .build()
+            }
+            (false, false) => {
+                // Should not happen — parse_transport_config defaults to TCP
+                return Err("No transport configured".into());
+            }
+        };
 
         let peer_id = *swarm.local_peer_id();
         let mut control = swarm.behaviour().new_control();
 
-        // Listen
-        swarm.listen_on(listen_addr.clone())?;
+        // Listen on all requested addresses (TCP and QUIC)
+        let mut listener_ids = std::collections::HashSet::new();
+        for addr in &listen_addrs {
+            let id = swarm.listen_on(addr.clone())?;
+            listener_ids.insert(id);
+        }
 
-        // Wait for the actual listen address
-        let (listen_ip, listen_port) = loop {
+        // Wait until every listener has reported at least one address
+        let mut resolved: Vec<Multiaddr> = Vec::new();
+        let mut seen_listeners = std::collections::HashSet::new();
+        loop {
             match swarm.next().await {
-                Some(SwarmEvent::NewListenAddr { address, .. }) => {
-                    debug!("Listening on {address}");
-                    let mut ip: Option<std::net::IpAddr> = None;
-                    let mut port: Option<u16> = None;
-                    for proto in address.iter() {
-                        match proto {
-                            libp2p::multiaddr::Protocol::Ip4(a) => ip = Some(a.into()),
-                            libp2p::multiaddr::Protocol::Ip6(a) => ip = Some(a.into()),
-                            libp2p::multiaddr::Protocol::Tcp(p) => port = Some(p),
-                            _ => {}
-                        }
+                Some(SwarmEvent::NewListenAddr { address, listener_id, .. }) => {
+                    debug!("Listening on {address} (listener {listener_id:?})");
+                    resolved.push(address);
+                    if listener_ids.contains(&listener_id) {
+                        seen_listeners.insert(listener_id);
                     }
-                    if let (Some(i), Some(p)) = (ip, port) {
-                        break (i, p);
+                    if seen_listeners.len() >= listener_ids.len() {
+                        break;
                     }
                 }
                 Some(_) => {}
@@ -552,13 +593,12 @@ pub fn spawn_swarm_task(
 
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
             peer_id,
-            listen_ip,
-            listen_port,
+            resolved,
             join_handle,
         ))
     })?;
 
-    Ok((cmd_tx, completion_rx, peer_id, listen_ip, listen_port, join_handle))
+    Ok((cmd_tx, completion_rx, peer_id, resolved_addrs, join_handle))
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ use crate::bindings::*;
 use crate::protocol::MessageType;
 use crate::runtime::{self, Command};
 use crate::state::*;
-use crate::{NA_CANCELED, NA_INVALID_ARG, NA_NOMEM, NA_OVERFLOW, NA_PROTOCOL_ERROR, NA_SUCCESS, NA_TIMEOUT};
+use crate::{NA_CANCELED, NA_INVALID_ARG, NA_NOMEM, NA_OVERFLOW, NA_PROTOCOL_ERROR, NA_SUCCESS};
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -26,13 +26,19 @@ unsafe fn get_class(na_class: *mut na_class_t) -> &'static NaLibp2pClass {
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe extern "C" fn na_libp2p_get_protocol_info(
-    _na_info: *const na_info,
+    na_info_p: *const na_info,
     na_protocol_info_p: *mut *mut na_protocol_info,
 ) -> na_return_t {
+    // Read protocol_name from na_info if available, otherwise default to "tcp"
+    let proto = if !na_info_p.is_null() && !unsafe { (*na_info_p).protocol_name }.is_null() {
+        unsafe { CStr::from_ptr((*na_info_p).protocol_name) }
+    } else {
+        c"tcp"
+    };
     let info = unsafe {
         na_protocol_info_alloc(
             c"libp2p".as_ptr(),
-            c"libp2p".as_ptr(),
+            proto.as_ptr(),
             c"tcp0".as_ptr(),
         )
     };
@@ -46,8 +52,12 @@ pub(crate) unsafe extern "C" fn na_libp2p_get_protocol_info(
 pub(crate) unsafe extern "C" fn na_libp2p_check_protocol(
     protocol_name: *const std::ffi::c_char,
 ) -> bool {
-    let name = unsafe { CStr::from_ptr(protocol_name) };
-    name == c"libp2p"
+    let name = unsafe { CStr::from_ptr(protocol_name) }.to_string_lossy();
+    // Accept "libp2p" for backward compat, plus "tcp", "quic", "tcp,quic", "quic,tcp"
+    if name == "libp2p" {
+        return true;
+    }
+    name.split(',').all(|part| matches!(part.trim(), "tcp" | "quic"))
 }
 
 // ---------------------------------------------------------------------------
@@ -56,13 +66,31 @@ pub(crate) unsafe extern "C" fn na_libp2p_check_protocol(
 
 pub(crate) unsafe extern "C" fn na_libp2p_initialize(
     na_class: *mut na_class_t,
-    _na_info: *const na_info,
+    na_info_p: *const na_info,
     listen: bool,
 ) -> na_return_t {
     // Init tracing (ignore errors if already initialized)
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+
+    // Parse protocol_name to determine transport configuration
+    let protocol_name = if !na_info_p.is_null() && !unsafe { (*na_info_p).protocol_name }.is_null()
+    {
+        unsafe { CStr::from_ptr((*na_info_p).protocol_name) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        String::new()
+    };
+
+    let transport_config = parse_transport_config(&protocol_name);
+
+    tracing::debug!(
+        "initialize: protocol_name='{}', transport_config={:?}",
+        protocol_name,
+        transport_config
+    );
 
     // Build tokio runtime
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -78,21 +106,25 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
 
     let event_fd = runtime::create_eventfd();
 
-    // Determine listen address
-    let listen_multiaddr: Multiaddr = if listen {
-        "/ip4/0.0.0.0/tcp/0".parse().unwrap()
-    } else {
-        "/ip4/127.0.0.1/tcp/0".parse().unwrap()
-    };
+    // Determine listen addresses based on transport config
+    let bind_ip = if listen { "0.0.0.0" } else { "127.0.0.1" };
+    let mut listen_addrs: Vec<Multiaddr> = Vec::new();
+    if transport_config.tcp {
+        listen_addrs.push(format!("/ip4/{bind_ip}/tcp/0").parse().unwrap());
+    }
+    if transport_config.quic {
+        listen_addrs.push(format!("/ip4/{bind_ip}/udp/0/quic-v1").parse().unwrap());
+    }
 
     let queues = Arc::new(Mutex::new(OperationQueues::new()));
     let mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let (cmd_tx, completion_rx, peer_id, listen_ip, listen_port, join_handle) =
+    let (cmd_tx, completion_rx, peer_id, resolved_addrs, join_handle) =
         match runtime::spawn_swarm_task(
             &rt,
-            listen_multiaddr,
+            listen_addrs,
+            &transport_config,
             queues.clone(),
             mem_handles.clone(),
             event_fd,
@@ -105,19 +137,14 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
             }
         };
 
-    // If listening on 0.0.0.0, resolve to a concrete address
-    let resolved_ip = if listen_ip.is_unspecified() {
-        hostname_ip().unwrap_or(listen_ip)
-    } else {
-        listen_ip
-    };
+    // Pick the priority transport's address as the self address.
+    let self_ma = resolve_self_multiaddr(&resolved_addrs, transport_config.priority);
 
-    let self_ma: Multiaddr = match resolved_ip {
-        std::net::IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/{listen_port}"),
-        std::net::IpAddr::V6(v6) => format!("/ip6/{v6}/tcp/{listen_port}"),
-    }
-    .parse()
-    .unwrap();
+    // Resolve all listen addrs (replace 0.0.0.0 with concrete IP)
+    let all_listen_addrs: Vec<Multiaddr> = resolved_addrs
+        .iter()
+        .map(|ma| resolve_multiaddr(ma))
+        .collect();
 
     let self_addr = Arc::new(NaLibp2pAddr {
         peer_id,
@@ -125,22 +152,115 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         is_self: true,
     });
 
-    // Extract the inner queues from the Arc (the async side also has a clone).
-    // We'll use the Arc directly in NaLibp2pClass instead of unwrapping.
     let state = Box::new(NaLibp2pClass {
         self_addr,
-        queues: queues,
+        queues,
         cmd_tx,
         completion_rx: Mutex::new(completion_rx),
         event_fd,
         runtime: Some(rt),
         swarm_join: Some(join_handle),
-        mem_handles: mem_handles,
+        mem_handles,
         next_mem_handle_id: AtomicU64::new(1),
+        transport_config,
+        listen_addrs: all_listen_addrs,
     });
 
     unsafe { (*na_class).plugin_class = Box::into_raw(state) as *mut c_void };
     NA_SUCCESS
+}
+
+/// Parse protocol_name string into a TransportConfig.
+fn parse_transport_config(protocol_name: &str) -> TransportConfig {
+    use crate::state::{TransportConfig, TransportKind};
+
+    if protocol_name.is_empty() || protocol_name == "libp2p" {
+        // Default / backward compat: TCP only
+        return TransportConfig {
+            tcp: true,
+            quic: false,
+            priority: TransportKind::Tcp,
+        };
+    }
+
+    let parts: Vec<&str> = protocol_name.split(',').map(|s| s.trim()).collect();
+    let mut tcp = false;
+    let mut quic = false;
+
+    for part in &parts {
+        match *part {
+            "tcp" => tcp = true,
+            "quic" => quic = true,
+            _ => {}
+        }
+    }
+
+    // If nothing valid was parsed, default to TCP
+    if !tcp && !quic {
+        return TransportConfig {
+            tcp: true,
+            quic: false,
+            priority: TransportKind::Tcp,
+        };
+    }
+
+    // Priority is the first listed transport
+    let priority = match parts[0] {
+        "quic" => TransportKind::Quic,
+        _ => TransportKind::Tcp,
+    };
+
+    TransportConfig {
+        tcp,
+        quic,
+        priority,
+    }
+}
+
+/// Pick the self-address from the resolved listen addresses based on the
+/// priority transport. If the IP is 0.0.0.0, resolves to a concrete address.
+fn resolve_self_multiaddr(
+    resolved_addrs: &[Multiaddr],
+    priority: crate::state::TransportKind,
+) -> Multiaddr {
+    use crate::state::TransportKind;
+
+    let addr = match priority {
+        TransportKind::Tcp => resolved_addrs
+            .iter()
+            .find(|a| {
+                a.iter()
+                    .any(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))
+            })
+            .unwrap_or(&resolved_addrs[0]),
+        TransportKind::Quic => resolved_addrs
+            .iter()
+            .find(|a| {
+                a.iter()
+                    .any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1))
+            })
+            .unwrap_or(&resolved_addrs[0]),
+    };
+
+    resolve_multiaddr(addr)
+}
+
+/// Resolve a multiaddr by replacing 0.0.0.0 with a concrete routable address.
+fn resolve_multiaddr(addr: &Multiaddr) -> Multiaddr {
+    let mut result = Multiaddr::empty();
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::Ip4(ip) if ip.is_unspecified() => {
+                let resolved = hostname_ip().unwrap_or(std::net::IpAddr::V4(ip));
+                match resolved {
+                    std::net::IpAddr::V4(v4) => result.push(libp2p::multiaddr::Protocol::Ip4(v4)),
+                    std::net::IpAddr::V6(v6) => result.push(libp2p::multiaddr::Protocol::Ip6(v6)),
+                }
+            }
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 fn hostname_ip() -> Option<std::net::IpAddr> {
@@ -252,10 +372,15 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
 
     tracing::debug!("addr_lookup: raw input='{}'", name_str);
 
-    // Strip protocol prefix: "libp2p+libp2p:", "libp2p:", or bare multiaddr
+    // Strip protocol prefix variants:
+    //   "libp2p+libp2p:", "libp2p:", "tcp:", "quic:", or bare multiaddr
+    // Mercury strips the "libp2p+" prefix before calling us, so we may receive
+    // "tcp:/ip4/...", "quic:/ip4/...", or legacy "libp2p:/ip4/..."
     let input = name_str
         .strip_prefix("libp2p+libp2p:")
         .or_else(|| name_str.strip_prefix("libp2p:"))
+        .or_else(|| name_str.strip_prefix("tcp:"))
+        .or_else(|| name_str.strip_prefix("quic:"))
         .unwrap_or(&name_str);
 
     // Split off the /p2p/<peer_id> component
@@ -367,16 +492,40 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_is_self(
 }
 
 pub(crate) unsafe extern "C" fn na_libp2p_addr_to_string(
-    _na_class: *mut na_class_t,
+    na_class: *mut na_class_t,
     buf: *mut std::ffi::c_char,
     buf_size: *mut usize,
     addr: *mut na_addr_t,
 ) -> na_return_t {
+    use crate::state::transport_prefix_for_multiaddr;
+
     if addr.is_null() || buf_size.is_null() {
         return NA_INVALID_ARG;
     }
     let a = unsafe { &*(addr as *const NaLibp2pAddr) };
-    let s = a.to_addr_string();
+
+    // Check for transport hint in the buffer (Mercury overwrites the "libp2p+"
+    // prefix, so we receive "tcp..." or "quic..." at the start of buf).
+    // This only applies to self-address queries.
+    let s = if a.is_self && !buf.is_null() && !na_class.is_null() {
+        let cls = unsafe { get_class(na_class) };
+        let hint = read_transport_hint(buf);
+        if let Some(transport_hint) = hint {
+            // Look up the requested transport's address from listen_addrs
+            if let Some(ma) = find_listen_addr_for_hint(&cls.listen_addrs, &transport_hint) {
+                let prefix = transport_prefix_for_multiaddr(&ma);
+                format!("{prefix}:{}/p2p/{}", ma, a.peer_id)
+            } else {
+                // Requested transport not available, fall back to default
+                a.to_addr_string()
+            }
+        } else {
+            a.to_addr_string()
+        }
+    } else {
+        a.to_addr_string()
+    };
+
     let needed = s.len() + 1;
 
     if buf.is_null() {
@@ -395,6 +544,45 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_to_string(
         *buf_size = needed;
     }
     NA_SUCCESS
+}
+
+/// Read a transport hint from the buffer. Mercury overwrites the "libp2p+"
+/// prefix (7 bytes), so what we see starts at the transport-specific part.
+/// Returns Some("tcp") or Some("quic") if recognized, None otherwise.
+fn read_transport_hint(buf: *const std::ffi::c_char) -> Option<String> {
+    // Read up to 5 bytes to check for "tcp" or "quic" prefix
+    let mut hint_bytes = [0u8; 5];
+    for i in 0..5 {
+        let b = unsafe { *(buf.add(i) as *const u8) };
+        if b == 0 {
+            break;
+        }
+        hint_bytes[i] = b;
+    }
+    let hint_str = std::str::from_utf8(&hint_bytes).unwrap_or("");
+    if hint_str.starts_with("quic") {
+        Some("quic".to_string())
+    } else if hint_str.starts_with("tcp") {
+        Some("tcp".to_string())
+    } else {
+        None
+    }
+}
+
+/// Find a listen address matching the requested transport hint.
+fn find_listen_addr_for_hint(listen_addrs: &[Multiaddr], hint: &str) -> Option<Multiaddr> {
+    match hint {
+        "tcp" => listen_addrs.iter().find(|a| {
+            a.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::Tcp(_)))
+        }),
+        "quic" => listen_addrs.iter().find(|a| {
+            a.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1))
+        }),
+        _ => None,
+    }
+    .cloned()
 }
 
 pub(crate) unsafe extern "C" fn na_libp2p_addr_get_serialize_size(
