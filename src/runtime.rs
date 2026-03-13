@@ -3,12 +3,13 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use futures::prelude::*;
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use libp2p_stream as stream;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::{self, MessageType, WireHeader};
 use crate::state::{
@@ -238,6 +239,25 @@ struct SharedAsyncState {
 }
 
 // ---------------------------------------------------------------------------
+//  Composite behaviour
+// ---------------------------------------------------------------------------
+
+#[derive(libp2p::swarm::NetworkBehaviour)]
+pub struct MercuryBehaviour {
+    pub stream: stream::Behaviour,
+    pub relay_client: libp2p::relay::client::Behaviour,
+    pub dcutr: libp2p::dcutr::Behaviour,
+}
+
+/// Extract the PeerId from the last /p2p/ component of a multiaddr.
+fn extract_peer_id_from_multiaddr(ma: &Multiaddr) -> Option<PeerId> {
+    ma.iter().filter_map(|p| match p {
+        Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    }).last()
+}
+
+// ---------------------------------------------------------------------------
 //  Swarm task
 // ---------------------------------------------------------------------------
 
@@ -251,6 +271,7 @@ pub fn spawn_swarm_task(
     queues: Arc<Mutex<OperationQueues>>,
     mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>>,
     event_fd: RawFd,
+    relay_addr: Option<Multiaddr>,
 ) -> Result<
     (
         mpsc::UnboundedSender<Command>,
@@ -280,7 +301,15 @@ pub fn spawn_swarm_task(
                         libp2p::yamux::Config::default,
                     )?
                     .with_quic()
-                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_relay_client(
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_behaviour(|keypair, relay_behaviour| MercuryBehaviour {
+                        stream: stream::Behaviour::new(),
+                        relay_client: relay_behaviour,
+                        dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                    })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
                     })
@@ -295,7 +324,15 @@ pub fn spawn_swarm_task(
                         libp2p::noise::Config::new,
                         libp2p::yamux::Config::default,
                     )?
-                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_relay_client(
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_behaviour(|keypair, relay_behaviour| MercuryBehaviour {
+                        stream: stream::Behaviour::new(),
+                        relay_client: relay_behaviour,
+                        dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                    })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
                     })
@@ -306,7 +343,15 @@ pub fn spawn_swarm_task(
                 libp2p::SwarmBuilder::with_new_identity()
                     .with_tokio()
                     .with_quic()
-                    .with_behaviour(|_| stream::Behaviour::new())?
+                    .with_relay_client(
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_behaviour(|keypair, relay_behaviour| MercuryBehaviour {
+                        stream: stream::Behaviour::new(),
+                        relay_client: relay_behaviour,
+                        dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                    })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
                     })
@@ -319,7 +364,7 @@ pub fn spawn_swarm_task(
         };
 
         let peer_id = *swarm.local_peer_id();
-        let mut control = swarm.behaviour().new_control();
+        let mut control = swarm.behaviour().stream.new_control();
 
         // Listen on all requested addresses (TCP and QUIC)
         let mut listener_ids = std::collections::HashSet::new();
@@ -350,6 +395,71 @@ pub fn spawn_swarm_task(
             }
         };
 
+        // Relay initialization: dial the relay server and make a reservation
+        if let Some(ref relay_ma) = relay_addr {
+            let relay_peer_id = extract_peer_id_from_multiaddr(relay_ma)
+                .expect("MERCURY_RELAY_ADDR must contain /p2p/<peer_id>");
+
+            // Strip the /p2p/<peer_id> from the relay address to get the transport multiaddr
+            let relay_transport_ma: Multiaddr = relay_ma.iter()
+                .take_while(|p| !matches!(p, Protocol::P2p(_)))
+                .collect();
+            swarm.add_peer_address(relay_peer_id, relay_transport_ma.clone());
+
+            info!("Dialing relay server {relay_peer_id} at {relay_ma}");
+            let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(relay_peer_id)
+                .addresses(vec![relay_transport_ma])
+                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                .build();
+            swarm.dial(dial_opts)?;
+
+            // Wait for connection to the relay
+            loop {
+                match swarm.next().await {
+                    Some(SwarmEvent::ConnectionEstablished { peer_id: pid, .. }) if pid == relay_peer_id => {
+                        info!("Connected to relay server {relay_peer_id}");
+                        break;
+                    }
+                    Some(SwarmEvent::OutgoingConnectionError { peer_id: Some(pid), error, .. }) if pid == relay_peer_id => {
+                        return Err(format!("Failed to connect to relay server {relay_peer_id}: {error}").into());
+                    }
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => {
+                        debug!("New listen address during relay init: {address}");
+                        resolved.push(address);
+                    }
+                    Some(_) => {}
+                    None => return Err("Swarm stream ended during relay init".into()),
+                }
+            }
+
+            // Listen via the relay (make a reservation)
+            let circuit_ma = relay_ma.clone().with(Protocol::P2pCircuit);
+            info!("Requesting relay reservation on {circuit_ma}");
+            swarm.listen_on(circuit_ma)?;
+
+            // Wait for the relay circuit listen address
+            loop {
+                match swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => {
+                        debug!("New listen address (relay): {address}");
+                        let is_circuit = address.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                        resolved.push(address);
+                        if is_circuit {
+                            info!("Relay reservation established");
+                            break;
+                        }
+                    }
+                    Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::RelayClient(
+                        libp2p::relay::client::Event::ReservationReqAccepted { .. }
+                    ))) => {
+                        info!("Relay reservation request accepted");
+                    }
+                    Some(_) => {}
+                    None => return Err("Swarm stream ended waiting for relay reservation".into()),
+                }
+            }
+        }
+
         // Accept incoming streams
         let mut incoming = control
             .accept(StreamProtocol::new(MERCURY_PROTOCOL))
@@ -368,7 +478,7 @@ pub fn spawn_swarm_task(
 
         // Spawn incoming stream handler
         let shared_incoming = shared.clone();
-        let incoming_control = swarm.behaviour().new_control();
+        let incoming_control = swarm.behaviour().stream.new_control();
         tokio::spawn(async move {
             // Per-peer sender pool for responses sent from incoming handlers
             let response_pool = Arc::new(tokio::sync::Mutex::new(PeerSenderPool::new()));
@@ -386,7 +496,11 @@ pub fn spawn_swarm_task(
 
         // Main command loop
         let shared_cmd = shared.clone();
-        let cmd_control = swarm.behaviour().new_control();
+        let cmd_control = swarm.behaviour().stream.new_control();
+        // Clone relay_addr into the event loop scope for reconnect logic
+        let relay_addr_for_loop = relay_addr.clone();
+        let relay_peer_id_for_loop = relay_addr.as_ref().and_then(|ma| extract_peer_id_from_multiaddr(ma));
+
         let join_handle = tokio::spawn(async move {
             let shared = shared_cmd;
             let mut cmd_rx = cmd_rx;
@@ -401,9 +515,22 @@ pub fn spawn_swarm_task(
                             }
                             Some(SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. }) => {
                                 warn!("Connection closed with {peer_id} (remaining={num_established}), cause: {cause:?}");
-                                // Auto-reconnect
                                 if num_established == 0 {
-                                    if let Some(addr) = shared.peer_addrs.lock().get(&peer_id).cloned() {
+                                    // Check if this is the relay server — reconnect if so
+                                    if relay_peer_id_for_loop == Some(peer_id) {
+                                        if let Some(ref relay_ma) = relay_addr_for_loop {
+                                            warn!("Relay server disconnected, re-dialing...");
+                                            let relay_transport_ma: Multiaddr = relay_ma.iter()
+                                                .take_while(|p| !matches!(p, Protocol::P2p(_)))
+                                                .collect();
+                                            swarm.add_peer_address(peer_id, relay_transport_ma);
+                                            let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                                                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                                .build();
+                                            let _ = swarm.dial(dial_opts);
+                                        }
+                                    } else if let Some(addr) = shared.peer_addrs.lock().get(&peer_id).cloned() {
+                                        // Auto-reconnect for regular peers
                                         swarm.add_peer_address(peer_id, addr.clone());
                                         let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
                                             .addresses(vec![addr])
@@ -421,6 +548,13 @@ pub fn spawn_swarm_task(
                             Some(SwarmEvent::IncomingConnectionError { error, .. }) => {
                                 warn!("Incoming connection error: {error}");
                             }
+                            Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::RelayClient(event))) => {
+                                info!("Relay client event: {event:?}");
+                            }
+                            Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Dcutr(event))) => {
+                                info!("DCUtR event: {event:?}");
+                            }
+                            Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Stream(()))) => {}
                             Some(_) => {}
                             None => break,
                         }

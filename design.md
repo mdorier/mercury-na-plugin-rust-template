@@ -30,6 +30,7 @@ developers who need to understand, maintain, or extend this codebase.
 19. [Memory Ownership and Safety](#19-memory-ownership-and-safety)
 20. [Configuration and Tuning](#20-configuration-and-tuning)
 21. [Design Decisions and Trade-offs](#21-design-decisions-and-trade-offs)
+22. [Circuit Relay Transport](#22-circuit-relay-transport)
 
 ---
 
@@ -943,3 +944,187 @@ Mercury's HG (higher-level RPC layer) treats any non-success return from
 `NA_Poll()` as a fatal error and aborts. Even when there are no completions to
 drain, returning `NA_SUCCESS` with `*count = 0` is correct — it simply means
 "no progress this time." This is consistent with how other NA plugins behave.
+
+---
+
+## 22. Circuit Relay Transport
+
+The plugin supports [libp2p circuit relay v2](https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md),
+allowing two peers to communicate through an intermediary relay server when
+direct connectivity is not possible (e.g., peers behind NAT or firewalls).
+
+### Concept
+
+In a relayed setup, three entities are involved:
+
+```
+                 ┌──────────────┐
+                 │ Relay Server │
+                 │  (standalone │
+                 │   process)   │
+                 └──┬───────┬───┘
+          TCP+Noise │       │ TCP+Noise
+          +Yamux    │       │ +Yamux
+                 ┌──┴──┐ ┌──┴──┐
+                 │ NA   │ │ NA   │
+                 │Server│ │Client│
+                 └──────┘ └──────┘
+```
+
+- **Relay server**: A standalone libp2p node that accepts relay reservations
+  and forwards traffic between peers. It does not run any Mercury code.
+- **NA server**: Registers a relay reservation with the relay server, making
+  itself reachable via a circuit address
+  (`/ip4/.../tcp/.../p2p/<relay_id>/p2p-circuit`).
+- **NA client**: Dials the NA server through the relay's circuit address.
+  The relay forwards traffic between the two peers.
+
+Once the relayed connection is established, the `/mercury-na/1.0.0` stream
+protocol works identically to a direct connection — the relay is transparent
+to the messaging layer.
+
+### Configuration
+
+Relay is enabled by including `relay` in the protocol name:
+
+```c
+NA_Initialize("tcp,relay://", true);   /* server: TCP + relay */
+NA_Initialize("tcp,relay://", false);  /* client: TCP + relay */
+```
+
+`parse_transport_config()` (`plugin.rs`) parses the comma-separated protocol
+string and sets `TransportConfig.relay = true`.
+
+The relay server address is read from the `MERCURY_RELAY_ADDR` environment
+variable, which must contain a full multiaddr with the relay's peer ID:
+
+```
+MERCURY_RELAY_ADDR=/ip4/10.0.0.1/tcp/4001/p2p/12D3KooW...
+```
+
+If `relay` is enabled in the config but `MERCURY_RELAY_ADDR` is not set, the
+relay client behaviour is loaded but remains dormant (no reservation is made).
+
+### Swarm construction
+
+The relay client behaviour is always included in the swarm, regardless of
+whether relay is configured. This is because `SwarmBuilder::with_relay_client()`
+must be called during construction — it cannot be added later.
+
+The swarm also includes:
+- **`relay::client::Behaviour`**: Manages relay reservations and circuit
+  connections.
+- **`dcutr::Behaviour`**: Direct Connection Upgrade through Relay — attempts
+  to upgrade a relayed connection to a direct one via hole-punching. If
+  hole-punching fails (common in test environments), communication continues
+  over the relay.
+
+```rust
+MercuryBehaviour {
+    stream: stream::Behaviour::new(),       // application protocol
+    relay_client: relay_behaviour,          // from with_relay_client()
+    dcutr: dcutr::Behaviour::new(peer_id), // hole-punching
+}
+```
+
+### Initialization sequence (`runtime.rs`)
+
+When `relay_addr` is `Some(...)`, the following steps run during
+`spawn_swarm_task()`, after the primary TCP/QUIC listeners are up:
+
+1. **Extract relay peer ID** from the multiaddr
+   (`/p2p/<relay_peer_id>` suffix).
+2. **Strip `/p2p/...`** to get the transport-only multiaddr
+   (e.g., `/ip4/10.0.0.1/tcp/4001`).
+3. **Register the relay's address** via `swarm.add_peer_address()`.
+4. **Dial the relay** with `DialOpts::peer_id(relay_peer_id)
+   .addresses(vec![transport_ma])`. Wait for `ConnectionEstablished`.
+5. **Request a relay reservation** by calling
+   `swarm.listen_on(relay_ma/p2p-circuit)`. This tells the relay that this
+   peer wants to be reachable through it.
+6. **Wait for the circuit listen address** — a `NewListenAddr` event
+   containing `/p2p-circuit` in the multiaddr confirms the reservation.
+   This address is added to `resolved_addrs`.
+
+After initialization, the circuit address is available alongside the
+regular TCP/QUIC addresses in the resolved address list.
+
+### Self-address selection
+
+`resolve_self_multiaddr()` (`plugin.rs`) selects which resolved address
+to use as the peer's self-address. When `relay` is true, it prefers the
+circuit address (identified by containing `/p2p-circuit`). This ensures
+that `NA_Addr_self()` returns the relayed address, which other peers should
+use to reach this node.
+
+The `addr_to_string` hint mechanism also supports relay: if the caller
+pre-fills the output buffer with `"relay:"`, `find_listen_addr_for_hint()`
+returns the circuit address from `listen_addrs`.
+
+### Address format for relay
+
+Circuit addresses follow standard libp2p multiaddr format:
+
+```
+relay:/ip4/<relay_ip>/tcp/<relay_port>/p2p/<relay_peer_id>/p2p-circuit/p2p/<target_peer_id>/p2p/<target_peer_id>
+```
+
+The `relay:` prefix is the Mercury transport hint (analogous to `tcp:` or
+`quic:`). During `addr_lookup()`, this prefix is stripped and the remaining
+multiaddr (which includes `/p2p-circuit`) is passed to
+`Command::AddKnownAddr`. The swarm's relay client behaviour recognizes the
+`/p2p-circuit` component and routes the dial through the relay.
+
+### Relay server reconnection
+
+The main event loop tracks the relay peer ID. If
+`SwarmEvent::ConnectionClosed` fires for the relay server (and
+`num_established == 0`), the loop automatically re-dials the relay to
+re-establish the reservation. This is handled separately from regular peer
+auto-reconnect because the relay address is stored in `relay_addr_for_loop`
+rather than in `peer_addrs`.
+
+### Relay limitations
+
+The relay server enforces default limits from `libp2p::relay::Behaviour`:
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `max_circuit_bytes` | 128 KiB | Total data per circuit |
+| `max_circuit_duration` | 120 s | Per-circuit time limit |
+| `max_reservations` | 128 | Concurrent reservations |
+| `max_circuits` | 16 | Concurrent active circuits |
+| `max_reservation_duration` | 3600 s | How long a reservation lasts |
+
+These limits are suitable for control-plane RPC (small messages, short
+interactions). Bulk data transfer over relay is impractical — use direct
+connections for `NA_Put` / `NA_Get` of large buffers.
+
+### Test infrastructure
+
+The relay test (`libp2p_relay_msg`) uses a 3-process setup orchestrated by
+`test/test_relay_driver.sh`:
+
+```
+test_relay_driver.sh
+  ├── test-relay-server       (Rust binary, test/relay-server/)
+  │     Listens on port 0, writes address to relay_addr.txt
+  │
+  ├── test_libp2p_relay_server  (C, links against libna)
+  │     Reads MERCURY_RELAY_ADDR from env, initializes with "tcp,relay",
+  │     makes relay reservation, writes circuit address to na_test_addr.txt
+  │
+  └── test_libp2p_relay_client  (C, links against libna)
+        Reads server circuit address from na_test_addr.txt,
+        initializes with "tcp,relay", exchanges messages through relay
+```
+
+The test relay server (`test/relay-server/`) is a minimal Rust binary based
+on the upstream `rust-libp2p/examples/relay-server`. It differs from the
+example in two ways:
+1. It writes its full multiaddr to `--addr-file` once listening (for
+   process coordination).
+2. It adds its own listen addresses as external addresses so that relay
+   reservations include routable addresses in the response (required by the
+   protocol — without external addresses, reservations fail with
+   `NoAddressesInReservation`).

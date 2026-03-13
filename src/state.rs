@@ -23,6 +23,7 @@ pub const MAX_MSG_SIZE: usize = 64 * 1024;
 pub struct TransportConfig {
     pub tcp: bool,
     pub quic: bool,
+    pub relay: bool,
     pub priority: TransportKind,
 }
 
@@ -52,6 +53,8 @@ pub struct NaLibp2pClass {
     pub transport_config: TransportConfig,
     /// All resolved listen multiaddrs (TCP and/or QUIC) — used by addr_to_string hints.
     pub listen_addrs: Vec<Multiaddr>,
+    /// Relay server address (when relay transport is enabled).
+    pub relay_addr: Option<Multiaddr>,
 }
 
 impl NaLibp2pClass {
@@ -193,6 +196,11 @@ pub struct NaLibp2pMemHandle {
 
 /// Determine transport prefix ("tcp" or "quic") from a multiaddr's content.
 pub fn transport_prefix_for_multiaddr(ma: &Multiaddr) -> &'static str {
+    for proto in ma.iter() {
+        if matches!(proto, libp2p::multiaddr::Protocol::P2pCircuit) {
+            return "relay";
+        }
+    }
     for proto in ma.iter() {
         if matches!(proto, libp2p::multiaddr::Protocol::QuicV1) {
             return "quic";

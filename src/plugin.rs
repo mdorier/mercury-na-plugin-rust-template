@@ -53,11 +53,11 @@ pub(crate) unsafe extern "C" fn na_libp2p_check_protocol(
     protocol_name: *const std::ffi::c_char,
 ) -> bool {
     let name = unsafe { CStr::from_ptr(protocol_name) }.to_string_lossy();
-    // Accept "libp2p" for backward compat, plus "tcp", "quic", "tcp,quic", "quic,tcp"
+    // Accept "libp2p" for backward compat, plus "tcp", "quic", "relay", and combinations
     if name == "libp2p" {
         return true;
     }
-    name.split(',').all(|part| matches!(part.trim(), "tcp" | "quic"))
+    name.split(',').all(|part| matches!(part.trim(), "tcp" | "quic" | "relay"))
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +116,28 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         listen_addrs.push(format!("/ip4/{bind_ip}/udp/0/quic-v1").parse().unwrap());
     }
 
+    // Read relay server address from environment if relay is enabled
+    let relay_addr: Option<Multiaddr> = if transport_config.relay {
+        match std::env::var("MERCURY_RELAY_ADDR") {
+            Ok(val) => match val.parse::<Multiaddr>() {
+                Ok(ma) => {
+                    tracing::info!("Relay enabled, relay server: {ma}");
+                    Some(ma)
+                }
+                Err(e) => {
+                    error!("MERCURY_RELAY_ADDR is not a valid multiaddr: {e}");
+                    return NA_PROTOCOL_ERROR;
+                }
+            },
+            Err(_) => {
+                tracing::debug!("Relay enabled in config but MERCURY_RELAY_ADDR not set, relay dormant");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let queues = Arc::new(Mutex::new(OperationQueues::new()));
     let mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -128,6 +150,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
             queues.clone(),
             mem_handles.clone(),
             event_fd,
+            relay_addr.clone(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -138,7 +161,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         };
 
     // Pick the priority transport's address as the self address.
-    let self_ma = resolve_self_multiaddr(&resolved_addrs, transport_config.priority);
+    let self_ma = resolve_self_multiaddr(&resolved_addrs, transport_config.priority, transport_config.relay);
 
     // Resolve all listen addrs (replace 0.0.0.0 with concrete IP)
     let all_listen_addrs: Vec<Multiaddr> = resolved_addrs
@@ -164,6 +187,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         next_mem_handle_id: AtomicU64::new(1),
         transport_config,
         listen_addrs: all_listen_addrs,
+        relay_addr,
     });
 
     unsafe { (*na_class).plugin_class = Box::into_raw(state) as *mut c_void };
@@ -179,6 +203,7 @@ fn parse_transport_config(protocol_name: &str) -> TransportConfig {
         return TransportConfig {
             tcp: true,
             quic: false,
+            relay: false,
             priority: TransportKind::Tcp,
         };
     }
@@ -186,11 +211,13 @@ fn parse_transport_config(protocol_name: &str) -> TransportConfig {
     let parts: Vec<&str> = protocol_name.split(',').map(|s| s.trim()).collect();
     let mut tcp = false;
     let mut quic = false;
+    let mut relay = false;
 
     for part in &parts {
         match *part {
             "tcp" => tcp = true,
             "quic" => quic = true,
+            "relay" => relay = true,
             _ => {}
         }
     }
@@ -200,6 +227,7 @@ fn parse_transport_config(protocol_name: &str) -> TransportConfig {
         return TransportConfig {
             tcp: true,
             quic: false,
+            relay,
             priority: TransportKind::Tcp,
         };
     }
@@ -213,17 +241,29 @@ fn parse_transport_config(protocol_name: &str) -> TransportConfig {
     TransportConfig {
         tcp,
         quic,
+        relay,
         priority,
     }
 }
 
 /// Pick the self-address from the resolved listen addresses based on the
 /// priority transport. If the IP is 0.0.0.0, resolves to a concrete address.
+/// When relay is enabled, prefer the circuit address.
 fn resolve_self_multiaddr(
     resolved_addrs: &[Multiaddr],
     priority: crate::state::TransportKind,
+    relay: bool,
 ) -> Multiaddr {
     use crate::state::TransportKind;
+
+    if relay {
+        if let Some(addr) = resolved_addrs.iter().find(|a| {
+            a.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+        }) {
+            return resolve_multiaddr(addr);
+        }
+    }
 
     let addr = match priority {
         TransportKind::Tcp => resolved_addrs
@@ -377,6 +417,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
     let input = name_str
         .strip_prefix("tcp:")
         .or_else(|| name_str.strip_prefix("quic:"))
+        .or_else(|| name_str.strip_prefix("relay:"))
         .unwrap_or(&name_str);
 
     // Split off the /p2p/<peer_id> component
@@ -546,9 +587,9 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_to_string(
 /// prefix (7 bytes), so what we see starts at the transport-specific part.
 /// Returns Some("tcp") or Some("quic") if recognized, None otherwise.
 fn read_transport_hint(buf: *const std::ffi::c_char) -> Option<String> {
-    // Read up to 5 bytes to check for "tcp" or "quic" prefix
-    let mut hint_bytes = [0u8; 5];
-    for i in 0..5 {
+    // Read up to 6 bytes to check for "tcp", "quic", or "relay" prefix
+    let mut hint_bytes = [0u8; 6];
+    for i in 0..6 {
         let b = unsafe { *(buf.add(i) as *const u8) };
         if b == 0 {
             break;
@@ -556,7 +597,9 @@ fn read_transport_hint(buf: *const std::ffi::c_char) -> Option<String> {
         hint_bytes[i] = b;
     }
     let hint_str = std::str::from_utf8(&hint_bytes).unwrap_or("");
-    if hint_str.starts_with("quic") {
+    if hint_str.starts_with("relay") {
+        Some("relay".to_string())
+    } else if hint_str.starts_with("quic") {
         Some("quic".to_string())
     } else if hint_str.starts_with("tcp") {
         Some("tcp".to_string())
@@ -575,6 +618,10 @@ fn find_listen_addr_for_hint(listen_addrs: &[Multiaddr], hint: &str) -> Option<M
         "quic" => listen_addrs.iter().find(|a| {
             a.iter()
                 .any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1))
+        }),
+        "relay" => listen_addrs.iter().find(|a| {
+            a.iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
         }),
         _ => None,
     }
