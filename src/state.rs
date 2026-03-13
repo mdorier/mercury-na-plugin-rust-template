@@ -4,7 +4,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
@@ -85,32 +85,30 @@ unsafe impl Send for MemHandleEntry {}
 
 pub struct NaLibp2pAddr {
     pub peer_id: PeerId,
-    pub ip: Option<std::net::IpAddr>,
-    pub port: Option<u16>,
+    /// Transport multiaddr (without the trailing /p2p/<peer_id> component).
+    /// None for peers discovered only via incoming connections.
+    pub multiaddr: Option<Multiaddr>,
     pub is_self: bool,
 }
 
 impl NaLibp2pAddr {
-    /// Format: `libp2p://<ip>:<port>/<base58-peer-id>`
+    /// Format: `libp2p:<multiaddr>/p2p/<peer-id>`
+    /// e.g.   `libp2p:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW...`
     pub fn to_addr_string(&self) -> String {
-        match (self.ip, self.port) {
-            (Some(ip), Some(port)) => {
-                format!("libp2p://{}:{}/{}", ip, port, self.peer_id)
-            }
-            _ => format!("libp2p://0.0.0.0:0/{}", self.peer_id),
+        match &self.multiaddr {
+            Some(ma) => format!("libp2p:{}/p2p/{}", ma, self.peer_id),
+            None => format!("libp2p:/p2p/{}", self.peer_id),
         }
     }
 
     pub fn alloc_boxed(
         peer_id: PeerId,
-        ip: Option<std::net::IpAddr>,
-        port: Option<u16>,
+        multiaddr: Option<Multiaddr>,
         is_self: bool,
     ) -> *mut Self {
         Box::into_raw(Box::new(Self {
             peer_id,
-            ip,
-            port,
+            multiaddr,
             is_self,
         }))
     }
@@ -118,8 +116,7 @@ impl NaLibp2pAddr {
     pub fn dup(src: &NaLibp2pAddr) -> *mut Self {
         Box::into_raw(Box::new(NaLibp2pAddr {
             peer_id: src.peer_id,
-            ip: src.ip,
-            port: src.port,
+            multiaddr: src.multiaddr.clone(),
             is_self: src.is_self,
         }))
     }

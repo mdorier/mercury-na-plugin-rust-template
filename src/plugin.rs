@@ -112,10 +112,16 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         listen_ip
     };
 
+    let self_ma: Multiaddr = match resolved_ip {
+        std::net::IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/{listen_port}"),
+        std::net::IpAddr::V6(v6) => format!("/ip6/{v6}/tcp/{listen_port}"),
+    }
+    .parse()
+    .unwrap();
+
     let self_addr = Arc::new(NaLibp2pAddr {
         peer_id,
-        ip: Some(resolved_ip),
-        port: Some(listen_port),
+        multiaddr: Some(self_ma),
         is_self: true,
     });
 
@@ -246,23 +252,22 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
 
     tracing::debug!("addr_lookup: raw input='{}'", name_str);
 
-    // Strip various prefixes Mercury might add:
-    // "libp2p+libp2p://...", "libp2p://...", or just "ip:port/peerid"
+    // Strip protocol prefix: "libp2p+libp2p:", "libp2p:", or bare multiaddr
     let input = name_str
-        .strip_prefix("libp2p+libp2p://")
-        .or_else(|| name_str.strip_prefix("libp2p://"))
+        .strip_prefix("libp2p+libp2p:")
+        .or_else(|| name_str.strip_prefix("libp2p:"))
         .unwrap_or(&name_str);
 
-    // Parse ip:port/peerid
-    let slash_pos = match input.rfind('/') {
+    // Split off the /p2p/<peer_id> component
+    let p2p_pos = match input.rfind("/p2p/") {
         Some(p) => p,
         None => {
-            error!("addr_lookup: no slash in '{input}'");
+            error!("addr_lookup: no /p2p/ component in '{input}'");
             return NA_PROTOCOL_ERROR;
         }
     };
-    let addr_part = &input[..slash_pos];
-    let peer_id_str = &input[slash_pos + 1..];
+    let transport_str = &input[..p2p_pos];
+    let peer_id_str = &input[p2p_pos + 5..];
 
     let peer_id = match peer_id_str.parse::<PeerId>() {
         Ok(p) => p,
@@ -272,47 +277,30 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
         }
     };
 
-    // Parse ip:port
-    let colon_pos = match addr_part.rfind(':') {
-        Some(p) => p,
-        None => {
-            error!("addr_lookup: no colon in addr_part '{addr_part}'");
-            return NA_PROTOCOL_ERROR;
-        }
-    };
-    let ip_str = &addr_part[..colon_pos];
-    let port_str = &addr_part[colon_pos + 1..];
-
-    let ip: std::net::IpAddr = match ip_str.parse() {
-        Ok(ip) => ip,
-        Err(e) => {
-            error!("addr_lookup: bad ip '{ip_str}': {e}");
-            return NA_PROTOCOL_ERROR;
-        }
-    };
-    let port: u16 = match port_str.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            error!("addr_lookup: bad port '{port_str}': {e}");
-            return NA_PROTOCOL_ERROR;
+    // Parse transport multiaddr (everything before /p2p/)
+    let transport_ma: Option<Multiaddr> = if transport_str.is_empty() {
+        None
+    } else {
+        match transport_str.parse::<Multiaddr>() {
+            Ok(ma) => Some(ma),
+            Err(e) => {
+                error!("addr_lookup: bad transport multiaddr '{transport_str}': {e}");
+                return NA_PROTOCOL_ERROR;
+            }
         }
     };
 
-    // Build multiaddr and tell swarm about it
-    let multiaddr: Multiaddr = match ip {
-        std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, port),
-        std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, port),
+    tracing::debug!("addr_lookup: peer_id={peer_id}, transport={transport_ma:?}");
+
+    // Tell the swarm about this peer's address
+    if let Some(ref ma) = transport_ma {
+        let _ = cls.cmd_tx.send(Command::AddKnownAddr {
+            peer_id,
+            multiaddr: ma.clone(),
+        });
     }
-    .parse()
-    .unwrap();
 
-    tracing::debug!("addr_lookup: input={input}, peer_id={peer_id}, multiaddr={multiaddr}");
-    let _ = cls.cmd_tx.send(Command::AddKnownAddr {
-        peer_id,
-        multiaddr,
-    });
-
-    let addr = NaLibp2pAddr::alloc_boxed(peer_id, Some(ip), Some(port), false);
+    let addr = NaLibp2pAddr::alloc_boxed(peer_id, transport_ma, false);
     unsafe { *addr_p = addr as *mut na_addr_t };
     NA_SUCCESS
 }
@@ -418,17 +406,9 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_get_serialize_size(
     }
     let a = unsafe { &*(addr as *const NaLibp2pAddr) };
     let peer_bytes = a.peer_id.to_bytes();
-    // [2B peer_id_len][peer_id_bytes][1B has_addr][optional: 1B ip_ver + ip_bytes + 2B port]
-    let mut size = 2 + peer_bytes.len() + 1;
-    if a.ip.is_some() && a.port.is_some() {
-        size += 1; // ip version marker
-        size += match a.ip.unwrap() {
-            std::net::IpAddr::V4(_) => 4,
-            std::net::IpAddr::V6(_) => 16,
-        };
-        size += 2; // port
-    }
-    size
+    let ma_str_len = a.multiaddr.as_ref().map(|m| m.to_string().len()).unwrap_or(0);
+    // [2B peer_id_len][peer_id_bytes][2B ma_str_len][ma_str_bytes]
+    2 + peer_bytes.len() + 2 + ma_str_len
 }
 
 pub(crate) unsafe extern "C" fn na_libp2p_addr_serialize(
@@ -442,6 +422,8 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_serialize(
     }
     let a = unsafe { &*(addr as *const NaLibp2pAddr) };
     let peer_bytes = a.peer_id.to_bytes();
+    let ma_str = a.multiaddr.as_ref().map(|m| m.to_string()).unwrap_or_default();
+    let ma_bytes = ma_str.as_bytes();
 
     let out = buf as *mut u8;
     let mut pos = 0usize;
@@ -459,23 +441,8 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_serialize(
 
     write_bytes!(&(peer_bytes.len() as u16).to_be_bytes());
     write_bytes!(&peer_bytes);
-
-    if let (Some(ip), Some(port)) = (a.ip, a.port) {
-        write_bytes!(&[1u8]);
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                write_bytes!(&[4u8]);
-                write_bytes!(&v4.octets());
-            }
-            std::net::IpAddr::V6(v6) => {
-                write_bytes!(&[6u8]);
-                write_bytes!(&v6.octets());
-            }
-        }
-        write_bytes!(&port.to_be_bytes());
-    } else {
-        write_bytes!(&[0u8]);
-    }
+    write_bytes!(&(ma_bytes.len() as u16).to_be_bytes());
+    write_bytes!(ma_bytes);
 
     NA_SUCCESS
 }
@@ -487,13 +454,14 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_deserialize(
     buf_size: usize,
     _flags: u64,
 ) -> na_return_t {
-    if buf.is_null() || addr_p.is_null() || buf_size < 3 {
+    if buf.is_null() || addr_p.is_null() || buf_size < 4 {
         return NA_INVALID_ARG;
     }
 
     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size) };
     let mut pos = 0;
 
+    // peer_id
     if pos + 2 > data.len() {
         return NA_PROTOCOL_ERROR;
     }
@@ -508,49 +476,29 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_deserialize(
     };
     pos += peer_id_len;
 
-    if pos >= data.len() {
+    // multiaddr (string-encoded)
+    if pos + 2 > data.len() {
         return NA_PROTOCOL_ERROR;
     }
-    let has_addr = data[pos];
-    pos += 1;
-
-    let (ip, port) = if has_addr != 0 {
-        if pos >= data.len() {
+    let ma_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let multiaddr = if ma_len > 0 {
+        if pos + ma_len > data.len() {
             return NA_PROTOCOL_ERROR;
         }
-        let ip_ver = data[pos];
-        pos += 1;
-
-        let ip: std::net::IpAddr = match ip_ver {
-            4 => {
-                if pos + 4 > data.len() {
-                    return NA_PROTOCOL_ERROR;
-                }
-                let octets: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
-                pos += 4;
-                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets))
-            }
-            6 => {
-                if pos + 16 > data.len() {
-                    return NA_PROTOCOL_ERROR;
-                }
-                let octets: [u8; 16] = data[pos..pos + 16].try_into().unwrap();
-                pos += 16;
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            }
-            _ => return NA_PROTOCOL_ERROR,
+        let ma_str = match std::str::from_utf8(&data[pos..pos + ma_len]) {
+            Ok(s) => s,
+            Err(_) => return NA_PROTOCOL_ERROR,
         };
-
-        if pos + 2 > data.len() {
-            return NA_PROTOCOL_ERROR;
+        match ma_str.parse::<Multiaddr>() {
+            Ok(ma) => Some(ma),
+            Err(_) => return NA_PROTOCOL_ERROR,
         }
-        let port = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        (Some(ip), Some(port))
     } else {
-        (None, None)
+        None
     };
 
-    let addr = NaLibp2pAddr::alloc_boxed(peer_id, ip, port, false);
+    let addr = NaLibp2pAddr::alloc_boxed(peer_id, multiaddr, false);
     unsafe { *addr_p = addr as *mut na_addr_t };
     NA_SUCCESS
 }

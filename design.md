@@ -208,20 +208,28 @@ messages if no matching recv is posted).
 
 ```rust
 pub struct NaLibp2pAddr {
-    pub peer_id: PeerId,                // libp2p cryptographic peer identity
-    pub ip: Option<std::net::IpAddr>,   // None for incoming-only peers
-    pub port: Option<u16>,
+    pub peer_id: PeerId,                  // libp2p cryptographic peer identity
+    pub multiaddr: Option<Multiaddr>,     // transport multiaddr (without /p2p/ suffix)
     pub is_self: bool,
 }
 ```
 
 Addresses are heap-allocated via `Box` and cast to/from `*mut na_addr_t` for
-FFI. The canonical string format is `libp2p://<ip>:<port>/<base58-peer-id>`.
+FFI. The canonical string format uses standard libp2p multiaddr convention:
+`libp2p:<multiaddr>/p2p/<peer-id>` (e.g.
+`libp2p:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW...`).
 
-Two peers are considered equal if their `PeerId` values match — the IP/port is
-only used for initial connection establishment. This is because libp2p
-connections are identified by cryptographic peer identity, not by network
-address.
+The `multiaddr` field stores the transport part only (without the trailing
+`/p2p/<peer-id>` component), since the peer identity is already in `peer_id`.
+This is `None` for peers discovered only via incoming connections.
+
+Two peers are considered equal if their `PeerId` values match — the transport
+address is only used for initial connection establishment. This is because
+libp2p connections are identified by cryptographic peer identity, not by
+network address.
+
+Because the address format is standard multiaddr, any transport that libp2p
+supports can be represented (TCP, QUIC, WebSocket, etc.).
 
 ### `NaLibp2pOpId` — operation handle
 
@@ -381,38 +389,47 @@ Called on `NA_Finalize()`. Steps:
 
 ### Address format
 
+Uses standard libp2p [multiaddr](https://multiformats.io/multiaddr/)
+convention, prefixed with the Mercury plugin name:
+
 ```
-libp2p://<ip>:<port>/<base58-peer-id>
+libp2p:<multiaddr>/p2p/<peer-id>
 ```
 
+Examples:
+- `libp2p:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW...` (TCP/IPv4)
+- `libp2p:/ip6/::1/tcp/5555/p2p/12D3KooW...` (TCP/IPv6)
+- `libp2p:/ip4/10.0.0.1/udp/9090/quic-v1/p2p/12D3KooW...` (QUIC)
+
 Also accepted during lookup:
-- `libp2p+libp2p://<ip>:<port>/<peer-id>` (Mercury canonical form)
-- `<ip>:<port>/<peer-id>` (bare form)
+- `libp2p+libp2p:<multiaddr>/p2p/<peer-id>` (Mercury canonical prefix)
+- `<multiaddr>/p2p/<peer-id>` (bare multiaddr)
 
 ### `addr_lookup()` — `plugin.rs:239`
 
-Parses the address string, extracts the PeerId and IP:port, constructs a
-multiaddr (`/ip4/<ip>/tcp/<port>`), and sends `Command::AddKnownAddr` to the
-swarm. The swarm calls `swarm.add_peer_address()` so libp2p knows where to
-dial the peer, then immediately attempts a dial with
-`PeerCondition::DisconnectedAndNotDialing` to establish the connection eagerly.
+Strips the `libp2p:` or `libp2p+libp2p:` prefix, then splits the remainder
+at `/p2p/` to separate the transport multiaddr from the peer ID. The transport
+part is parsed as a `Multiaddr` (supporting any transport: TCP, QUIC, etc.)
+and the peer ID is parsed as a base58 `PeerId`.
+
+If a transport multiaddr is present, `Command::AddKnownAddr` is sent to the
+swarm, which calls `swarm.add_peer_address()` and immediately attempts a dial
+with `PeerCondition::DisconnectedAndNotDialing` to establish the connection
+eagerly.
 
 ### Address comparison
 
 Two addresses are equal if and only if their `PeerId` values match. The
-IP/port is not considered because libp2p identifies peers by cryptographic
-identity, not network address.
+transport multiaddr is not considered because libp2p identifies peers by
+cryptographic identity, not network address.
 
 ### Serialization format
 
 ```
 [2 bytes]  peer_id_len (big-endian u16)
 [N bytes]  peer_id (protobuf-encoded public key)
-[1 byte]   has_addr (0 or 1)
--- if has_addr == 1:
-[1 byte]   ip_version (4 or 6)
-[4 or 16]  ip_bytes
-[2 bytes]  port (big-endian u16)
+[2 bytes]  multiaddr_str_len (big-endian u16, 0 if no transport address)
+[M bytes]  multiaddr_str (UTF-8 string, e.g. "/ip4/10.0.0.1/tcp/5555")
 ```
 
 ---

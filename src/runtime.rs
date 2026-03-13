@@ -609,7 +609,7 @@ fn handle_incoming_msg(
     payload: Vec<u8>,
     expected: bool,
 ) {
-    let source_addr = NaLibp2pAddr::alloc_boxed(header.source_peer_id, None, None, false);
+    let source_addr = NaLibp2pAddr::alloc_boxed(header.source_peer_id, None, false);
 
     let mut queues = shared.queues.lock();
 

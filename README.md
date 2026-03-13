@@ -140,7 +140,7 @@ NA_Addr_self(na_class, &self_addr);
 char buf[256];
 na_size_t buf_size = sizeof(buf);
 NA_Addr_to_string(na_class, buf, &buf_size, self_addr);
-/* buf now contains e.g. "libp2p://192.168.1.10:43210/12D3KooW..." */
+/* buf now contains e.g. "libp2p:/ip4/192.168.1.10/tcp/43210/p2p/12D3KooW..." */
 ```
 
 ### 4. Look up a remote peer
@@ -148,22 +148,33 @@ NA_Addr_to_string(na_class, buf, &buf_size, self_addr);
 ```c
 na_addr_t target_addr;
 NA_Addr_lookup(na_class,
-               "libp2p://192.168.1.20:43211/12D3KooWABC...",
+               "libp2p:/ip4/192.168.1.20/tcp/43211/p2p/12D3KooWABC...",
                &target_addr);
 ```
 
 #### Address format
 
-```
-libp2p://IP:PORT/PEERID
-```
-
-`PEERID` is the base58-encoded libp2p peer ID (typically starts with
-`12D3KooW`). The following prefixed forms are also accepted:
+Addresses use the standard libp2p
+[multiaddr](https://multiformats.io/multiaddr/) convention, prefixed
+with the Mercury plugin name:
 
 ```
-libp2p+libp2p://IP:PORT/PEERID   (Mercury canonical form)
-IP:PORT/PEERID                    (bare form)
+libp2p:<multiaddr>/p2p/<peer-id>
+```
+
+Examples:
+
+```
+libp2p:/ip4/192.168.1.20/tcp/43211/p2p/12D3KooWABC...   (TCP)
+libp2p:/ip4/10.0.0.1/udp/9090/quic-v1/p2p/12D3KooW...  (QUIC)
+libp2p:/ip6/::1/tcp/5555/p2p/12D3KooW...                (IPv6 TCP)
+```
+
+`<peer-id>` is the base58-encoded libp2p peer ID (typically starts with
+`12D3KooW`). The following prefixed form is also accepted during lookup:
+
+```
+libp2p+libp2p:<multiaddr>/p2p/<peer-id>   (Mercury canonical prefix)
 ```
 
 ### 5. Send and receive messages
