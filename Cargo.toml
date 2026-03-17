@@ -12,7 +12,7 @@ bindgen = "0.71"
 pkg-config = "0.3"
 
 [dependencies]
-libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "quic", "relay", "dcutr", "macros"] }
+libp2p = { version = "0.56", features = ["tokio", "tcp", "noise", "yamux", "quic", "relay", "dcutr", "identify", "macros"] }
 libp2p-stream = "0.4.0-alpha"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time", "io-util"] }
 futures = "0.3"

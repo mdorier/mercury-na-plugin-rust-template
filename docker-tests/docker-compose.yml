@@ -1,0 +1,73 @@
+# NAT-simulated topology for Scenarios 1 (relay RPC) and 3 (relay bulk).
+#
+# All containers on one network, but peers use iptables to block direct
+# peer-to-peer traffic. Each peer can only reach the relay, not the other
+# peer. This simulates NAT isolation without requiring multi-network
+# containers (which have Docker engine bugs on some platforms).
+#
+#              test_net (172.20.0.0/24)
+#             /          |          \
+#      relay         peer_a       peer_b
+#    172.20.0.10    172.20.0.20   172.20.0.30
+#
+# iptables on peer_a: DROP traffic to/from 172.20.0.30
+# iptables on peer_b: DROP traffic to/from 172.20.0.20
+# => peers cannot reach each other, only relay
+
+networks:
+  test_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+services:
+  relay:
+    image: mercury-nat-test:runtime
+    container_name: relay
+    networks:
+      test_net:
+        ipv4_address: 172.20.0.10
+    command: >
+      /opt/bin/mercury-na-relay-server
+        --port 4001 --secret-key-seed 1
+        --addr-file /shared/relay_addr.txt
+    volumes:
+      - shared:/shared
+
+  peer_a:
+    image: mercury-nat-test:runtime
+    container_name: peer_a
+    cap_add: [NET_ADMIN]
+    networks:
+      test_net: { ipv4_address: 172.20.0.20 }
+    volumes:
+      - shared:/shared
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Block direct traffic to/from peer_b
+        iptables -A INPUT -s 172.20.0.30 -j DROP
+        iptables -A OUTPUT -d 172.20.0.30 -j DROP
+        exec sleep infinity
+    depends_on: [relay]
+
+  peer_b:
+    image: mercury-nat-test:runtime
+    container_name: peer_b
+    cap_add: [NET_ADMIN]
+    networks:
+      test_net: { ipv4_address: 172.20.0.30 }
+    volumes:
+      - shared:/shared
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        # Block direct traffic to/from peer_a
+        iptables -A INPUT -s 172.20.0.20 -j DROP
+        iptables -A OUTPUT -d 172.20.0.20 -j DROP
+        exec sleep infinity
+    depends_on: [relay]
+
+volumes:
+  shared:

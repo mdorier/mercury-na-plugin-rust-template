@@ -614,11 +614,11 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_to_string(
 
 /// Read a transport hint from the buffer. Mercury overwrites the "libp2p+"
 /// prefix (7 bytes), so what we see starts at the transport-specific part.
-/// Returns Some("tcp") or Some("quic") if recognized, None otherwise.
+/// Returns Some("tcp"), Some("relay"), or Some("quic") if recognized, None otherwise.
 fn read_transport_hint(buf: *const std::ffi::c_char) -> Option<String> {
-    // Read up to 6 bytes to check for "tcp", "quic", or "relay" prefix
-    let mut hint_bytes = [0u8; 6];
-    for i in 0..6 {
+    // Read up to 10 bytes to check for "tcp,relay", "tcp", "quic", or "relay" prefix
+    let mut hint_bytes = [0u8; 10];
+    for i in 0..10 {
         let b = unsafe { *(buf.add(i) as *const u8) };
         if b == 0 {
             break;
@@ -626,7 +626,11 @@ fn read_transport_hint(buf: *const std::ffi::c_char) -> Option<String> {
         hint_bytes[i] = b;
     }
     let hint_str = std::str::from_utf8(&hint_bytes).unwrap_or("");
-    if hint_str.starts_with("relay") {
+    if hint_str.starts_with("tcp,relay") {
+        // "tcp,relay" protocol: return relay hint for self-address so we
+        // get the circuit address instead of the direct TCP address.
+        Some("relay".to_string())
+    } else if hint_str.starts_with("relay") {
         Some("relay".to_string())
     } else if hint_str.starts_with("quic") {
         Some("quic".to_string())

@@ -152,3 +152,33 @@ set_tests_properties(libp2p_dcutr
     PROPERTIES
         ENVIRONMENT "NA_PLUGIN_PATH=${_na_plugin_dir}"
         TIMEOUT 90)
+
+# ============================================================
+# NAT Docker test programs
+# ============================================================
+
+# HG server that publishes relay circuit address
+add_executable(test_nat_hg_server
+    ${CMAKE_CURRENT_SOURCE_DIR}/../docker-tests/test-programs/test_nat_hg_server.c)
+target_link_libraries(test_nat_hg_server PRIVATE hg_test_common_lib)
+
+# Minimal HG RPC client for relay scenarios
+add_executable(test_nat_hg_rpc_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/../docker-tests/test-programs/test_nat_hg_rpc_client.c)
+target_link_libraries(test_nat_hg_rpc_client PRIVATE hg_test_common_lib)
+
+# HG client with DCUtR verification flow
+add_executable(test_nat_hg_dcutr_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/../docker-tests/test-programs/test_nat_hg_dcutr_client.c)
+target_link_libraries(test_nat_hg_dcutr_client PRIVATE hg_test_common_lib)
+
+# Docker-based NAT integration tests (requires Docker)
+find_program(DOCKER_EXECUTABLE docker)
+if(DOCKER_EXECUTABLE)
+    add_test(NAME docker_nat_tests
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../docker-tests/scripts/run-tests.sh
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../docker-tests)
+    set_tests_properties(docker_nat_tests PROPERTIES
+        TIMEOUT 600
+        LABELS "docker;nat;slow")
+endif()

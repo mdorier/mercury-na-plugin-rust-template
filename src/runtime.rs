@@ -258,6 +258,7 @@ pub struct MercuryBehaviour {
     pub stream: stream::Behaviour,
     pub relay_client: libp2p::relay::client::Behaviour,
     pub dcutr: libp2p::dcutr::Behaviour,
+    pub identify: libp2p::identify::Behaviour,
 }
 
 /// Extract the PeerId from the last /p2p/ component of a multiaddr.
@@ -320,6 +321,12 @@ pub fn spawn_swarm_task(
                         stream: stream::Behaviour::new(),
                         relay_client: relay_behaviour,
                         dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                        identify: libp2p::identify::Behaviour::new(
+                            libp2p::identify::Config::new(
+                                "/mercury-na/1.0.0".to_string(),
+                                keypair.public(),
+                            ),
+                        ),
                     })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
@@ -343,6 +350,12 @@ pub fn spawn_swarm_task(
                         stream: stream::Behaviour::new(),
                         relay_client: relay_behaviour,
                         dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                        identify: libp2p::identify::Behaviour::new(
+                            libp2p::identify::Config::new(
+                                "/mercury-na/1.0.0".to_string(),
+                                keypair.public(),
+                            ),
+                        ),
                     })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
@@ -362,6 +375,12 @@ pub fn spawn_swarm_task(
                         stream: stream::Behaviour::new(),
                         relay_client: relay_behaviour,
                         dcutr: libp2p::dcutr::Behaviour::new(keypair.public().to_peer_id()),
+                        identify: libp2p::identify::Behaviour::new(
+                            libp2p::identify::Config::new(
+                                "/mercury-na/1.0.0".to_string(),
+                                keypair.public(),
+                            ),
+                        ),
                     })?
                     .with_swarm_config(|cfg| {
                         cfg.with_idle_connection_timeout(std::time::Duration::from_secs(3600))
@@ -553,7 +572,10 @@ pub fn spawn_swarm_task(
                                         info!("Relay connection established with {peer_id}, waiting for DCUtR...");
                                     } else {
                                         // Direct connection — DCUtR succeeded (or wasn't needed)
-                                        info!("Direct connection established with {peer_id}, DCUtR succeeded");
+                                        let direct_addr = endpoint.get_remote_address().clone();
+                                        info!("Direct connection established with {peer_id} at {direct_addr}, DCUtR succeeded");
+                                        // Update peer_addrs with direct address (replaces relay circuit)
+                                        shared.peer_addrs.lock().insert(peer_id, direct_addr);
                                         if let Some(mut pending) = pending_dcutr.remove(&peer_id) {
                                             sender_pool.senders.remove(&peer_id);
                                             if let Some(tx) = pending.result_tx.take() {
@@ -563,8 +585,8 @@ pub fn spawn_swarm_task(
                                     }
                                 }
                             }
-                            Some(SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. }) => {
-                                warn!("Connection closed with {peer_id} (remaining={num_established}), cause: {cause:?}");
+                            Some(SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, .. }) => {
+                                warn!("Connection closed with {peer_id} (remaining={num_established}, conn_id={connection_id:?}), cause: {cause:?}");
                                 if num_established == 0 {
                                     // Check if this is the relay server — reconnect if so
                                     if relay_peer_id_for_loop == Some(peer_id) {
@@ -635,6 +657,9 @@ pub fn spawn_swarm_task(
                                         }
                                     }
                                 }
+                            }
+                            Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Identify(event))) => {
+                                debug!("Identify event: {event:?}");
                             }
                             Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Stream(()))) => {}
                             Some(_) => {}

@@ -86,12 +86,14 @@ MERCURY_INCLUDE_DIR=/path/to/include:/path/to/extra/headers ...
 
 ## Running the Tests
 
+### Localhost tests
+
 ```bash
 cd build
 NA_PLUGIN_PATH=./cargo-build/release ctest --output-on-failure
 ```
 
-Eight test suites are included:
+Eight localhost test suites are included:
 
 | Test | What it covers |
 |------|----------------|
@@ -103,6 +105,36 @@ Eight test suites are included:
 | `libp2p_bulk`      | RMA put/get bulk data transfer |
 | `libp2p_relay_msg` | Message send/recv over a relayed connection (3-process) |
 | `libp2p_dcutr`     | DCUtR hole-punch: relay killed after lookup, messaging over direct connection |
+
+### Docker NAT integration tests
+
+Docker-based tests place peers in isolated network namespaces where direct
+connectivity is blocked via iptables, exercising realistic NAT traversal
+and relay fallback scenarios. Requires Docker.
+
+```bash
+cd docker-tests
+./scripts/run-tests.sh
+```
+
+This builds the Docker images and runs 3 scenarios:
+
+| Scenario | Script | What it proves |
+|----------|--------|---------------|
+| Relay RPC | `scenario-relay-rpc.sh` | HG RPC works through relay when peers are network-isolated |
+| DCUtR success | `scenario-dcutr-success.sh` | DCUtR upgrades to direct connection; relay killed; RPC works over direct path |
+| Relay bulk | `scenario-relay-bulk.sh` | Bulk data transfer works through relay (reduced buffer size) |
+
+To run Docker tests via CTest (requires Docker):
+
+```bash
+cd build
+ctest -L docker --output-on-failure    # Docker tests only
+ctest -LE docker --output-on-failure   # Skip Docker tests
+```
+
+See `docker-tests/` and the [design document](design.md) §24 for details
+on the network topology, test programs, and signal-file coordination.
 
 ## Using the Plugin
 
@@ -237,8 +269,8 @@ mercury-na-relay-server \
 | `--addr-file <path>` | Write the relay's full multiaddr to this file once listening (required) |
 
 The relay server logs its multiaddr(s) to stdout and writes the first
-one (with `0.0.0.0` resolved to `127.0.0.1`) to the addr-file. Example
-output:
+one (with `0.0.0.0` resolved to the machine's routable IP) to the
+addr-file. Example output:
 
 ```
 Relay server PeerId: 12D3KooWPjce...

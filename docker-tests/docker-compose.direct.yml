@@ -1,0 +1,44 @@
+# Simplified topology for Scenario 2 (DCUtR success).
+# All containers on the same network — DCUtR succeeds because
+# peers can reach each other directly.
+
+networks:
+  public_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+services:
+  relay:
+    image: mercury-nat-test:runtime
+    container_name: relay
+    networks:
+      public_net: { ipv4_address: 172.20.0.10 }
+    command: >
+      /opt/bin/mercury-na-relay-server
+        --port 4001 --secret-key-seed 1
+        --addr-file /shared/relay_addr.txt
+    volumes:
+      - shared:/shared
+
+  peer_a:
+    image: mercury-nat-test:runtime
+    container_name: peer_a
+    networks:
+      public_net: { ipv4_address: 172.20.0.20 }
+    volumes:
+      - shared:/shared
+    command: ["sleep", "infinity"]
+
+  peer_b:
+    image: mercury-nat-test:runtime
+    container_name: peer_b
+    networks:
+      public_net: { ipv4_address: 172.20.0.30 }
+    volumes:
+      - shared:/shared
+    command: ["sleep", "infinity"]
+
+volumes:
+  shared:

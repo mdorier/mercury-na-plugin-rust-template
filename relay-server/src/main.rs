@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use futures::StreamExt;
 use libp2p::{
@@ -14,6 +14,22 @@ struct Behaviour {
     relay: relay::Behaviour,
     ping: ping::Behaviour,
     identify: identify::Behaviour,
+}
+
+fn hostname_ip() -> Ipv4Addr {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| {
+            s.connect("8.8.8.8:80").ok()?;
+            s.local_addr().ok()
+        });
+    match socket {
+        Some(addr) => match addr.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => Ipv4Addr::LOCALHOST,
+        },
+        None => Ipv4Addr::LOCALHOST,
+    }
 }
 
 fn generate_ed25519(seed: u8) -> identity::Keypair {
@@ -124,16 +140,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             event = swarm.next() => {
                 match event.expect("swarm stream ended") {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        // Resolve 0.0.0.0 to 127.0.0.1 for local tests
+                        // Resolve 0.0.0.0 to the host's routable IP
                         let resolved: Multiaddr = address
                             .iter()
                             .map(|p| match p {
                                 Protocol::Ip4(ip) if ip.is_unspecified() => {
-                                    Protocol::Ip4(Ipv4Addr::LOCALHOST)
+                                    Protocol::Ip4(hostname_ip())
                                 }
                                 other => other,
                             })
                             .collect();
+
+                        // Check if this is a loopback address
+                        let is_loopback = resolved.iter().any(|p| matches!(p,
+                            Protocol::Ip4(ip) if ip.is_loopback()));
 
                         // Add resolved address as external so relay
                         // reservations include it in the response.
@@ -142,10 +162,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let full_addr = format!("{resolved}/p2p/{local_peer_id}");
                         println!("Relay listening on {full_addr}");
 
-                        if !addr_written {
+                        // Prefer non-loopback address for the addr file
+                        // so peers on other containers can reach us.
+                        if !addr_written || !is_loopback {
                             std::fs::write(&addr_file, &full_addr)
                                 .expect("failed to write addr file");
-                            addr_written = true;
+                            if !is_loopback {
+                                addr_written = true;
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Identify(
