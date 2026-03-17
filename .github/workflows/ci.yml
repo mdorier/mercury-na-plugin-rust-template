@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libclang-dev \
+            libtool autoconf automake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Cache Mercury build
+        id: cache-mercury
+        uses: actions/cache@v4
+        with:
+          path: ~/mercury-install
+          key: mercury-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Build Mercury from source
+        if: steps.cache-mercury.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/mercury-hpc/mercury.git /tmp/mercury
+          cmake -S /tmp/mercury -B /tmp/mercury-build \
+            -DCMAKE_INSTALL_PREFIX=$HOME/mercury-install \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TESTING=OFF \
+            -DMERCURY_USE_BOOST_PP=ON \
+            -DMERCURY_USE_CHECKSUMS=OFF \
+            -DNA_USE_DYNAMIC_PLUGINS=ON \
+            -DNA_USE_SM=OFF \
+            -DNA_USE_OFI=OFF \
+            -DNA_USE_MPI=OFF
+          cmake --build /tmp/mercury-build -j$(nproc)
+          cmake --install /tmp/mercury-build
+
+      - name: Build plugin and tests
+        run: |
+          cmake -S . -B build \
+            -Dmercury_DIR=$HOME/mercury-install/share/cmake/mercury
+          cmake --build build -j$(nproc)
+
+      - name: Run tests (excluding Docker)
+        run: |
+          cd build
+          ctest -LE docker --output-on-failure
+        env:
+          NA_PLUGIN_PATH: ${{ github.workspace }}/build/cargo-build/release
